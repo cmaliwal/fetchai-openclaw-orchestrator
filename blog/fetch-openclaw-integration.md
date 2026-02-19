@@ -360,10 +360,12 @@ For safe testing, the included `scripts/setup_demo.py` generates a `demo_project
 
 ## Try It Locally
 
+**GitHub Repo:** [cmaliwal/fetchai-openclaw-orchestrator](https://github.com/cmaliwal/fetchai-openclaw-orchestrator)
+
 ```bash
 # Clone and install
-git clone <repo-url>
-cd openclaw-fetch
+git clone https://github.com/cmaliwal/fetchai-openclaw-orchestrator.git
+cd fetchai-openclaw-orchestrator
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 

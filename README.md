@@ -32,8 +32,8 @@ User --> ASI:One --> Orchestrator Agent --> [signed task plan] --> OpenClaw Conn
 ### 2. Install
 
 ```bash
-git clone <repo-url>
-cd openclaw-fetch
+git clone https://github.com/cmaliwal/fetchai-openclaw-orchestrator.git
+cd fetchai-openclaw-orchestrator
 
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
