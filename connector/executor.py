@@ -28,6 +28,11 @@ from connector.workflows.weekly_report import (
     post_summary,
     scan_directory,
 )
+from connector.workflows.repo_analyzer import (
+    analyze_repo,
+    clone_repo,
+    generate_health_report,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +46,14 @@ ActionFn = Callable[[dict[str, Any]], dict[str, Any]]
 ActionFn2 = Callable[[dict[str, Any], dict[str, Any] | None], dict[str, Any]]
 
 _ACTIONS: dict[str, ActionFn | ActionFn2] = {
+    # Weekly report workflow
     "scan_directory": scan_directory,
     "generate_report": generate_report,
     "post_summary": post_summary,
+    # Repo analyzer workflow
+    "clone_repo": clone_repo,
+    "analyze_repo": analyze_repo,
+    "generate_health_report": generate_health_report,
 }
 
 

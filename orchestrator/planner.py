@@ -74,9 +74,16 @@ Given a user objective, produce a JSON task plan with the following structure:
 }
 
 Available LOCAL actions:
+
+  WEEKLY REPORT WORKFLOW:
   - scan_directory: params {"path": "./demo_projects"} (always use ./demo_projects)
   - generate_report: params {"format": "pdf"|"markdown"|"text"}
   - summarise_text: params {"text": "<text_to_summarise>"}
+
+  GITHUB REPO HEALTH ANALYZER:
+  - clone_repo: params {"url": "<github_https_url>"}
+  - analyze_repo: params {} (uses output of clone_repo)
+  - generate_health_report: params {} (uses output of analyze_repo)
 
 Available EXTERNAL actions:
   - post_summary: params {"target": "slack"|"email"}
@@ -88,6 +95,9 @@ Rules:
   - Use "external" type for sending/posting/sharing.
   - Always set no_delete: true and require_user_confirmation: true.
   - ALWAYS use "./demo_projects" as the path for scan_directory. Never use real user paths.
+  - For GitHub repo analysis: use clone_repo, then analyze_repo, then generate_health_report.
+  - The URL for clone_repo must be a public GitHub HTTPS URL (https://github.com/owner/repo).
+  - Extract the GitHub URL from the user's message if present.
 """
 
 
@@ -161,16 +171,96 @@ _REPORT_KEYWORDS = re.compile(
     r"\b(report|summary|summarise|summarize|digest|weekly|daily)\b", re.I
 )
 _SCAN_KEYWORDS = re.compile(
-    r"\b(scan|list|find|search|directory|repo|project)\b", re.I
+    r"\b(scan|list|find|search|directory|project)\b", re.I
 )
 _POST_KEYWORDS = re.compile(
     r"\b(post|send|publish|share|slack|email|notify)\b", re.I
 )
+_GITHUB_URL_RE = re.compile(
+    r"https://github\.com/[\w.\-]+/[\w.\-]+"
+)
+_REPO_ANALYZE_KEYWORDS = re.compile(
+    r"\b(analyze|analyse|review|audit|health|check|score|inspect)\b", re.I
+)
+
+
+def _extract_github_url(text: str) -> str | None:
+    """Extract the first GitHub URL from the text."""
+    match = _GITHUB_URL_RE.search(text)
+    if match:
+        url = match.group(0).rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+        return url
+    return None
 
 
 def _plan_with_keywords(objective: str) -> TaskPlan:
     """Keyword-based fallback planner (no LLM required)."""
     steps: list[TaskStep] = []
+
+    # Check for GitHub repo analysis first
+    github_url = _extract_github_url(objective)
+    if github_url:
+        # GitHub Repo Health Analyzer workflow
+        steps.append(
+            TaskStep(
+                type=StepType.LOCAL,
+                action="clone_repo",
+                params={"url": github_url},
+            )
+        )
+        steps.append(
+            TaskStep(
+                type=StepType.LOCAL,
+                action="analyze_repo",
+                params={},
+            )
+        )
+        steps.append(
+            TaskStep(
+                type=StepType.LOCAL,
+                action="generate_health_report",
+                params={},
+            )
+        )
+        # Plan done for repo analysis
+        plan = TaskPlan(
+            steps=steps,
+            constraints=TaskConstraints(
+                no_delete=True,
+                require_user_confirmation=True,
+            ),
+        )
+        logger.info(
+            "Keyword-planned repo analysis %s for: %.60s...",
+            plan.task_id, objective,
+        )
+        return plan
+
+    # Also match "analyze repo" style without URL (ask for it)
+    if _REPO_ANALYZE_KEYWORDS.search(objective) and re.search(r"\brepo\b", objective, re.I) and not github_url:
+        steps.append(
+            TaskStep(
+                type=StepType.LOCAL,
+                action="clone_repo",
+                params={"url": ""},  # will prompt for URL
+            )
+        )
+        steps.append(
+            TaskStep(type=StepType.LOCAL, action="analyze_repo", params={},
+            )
+        )
+        steps.append(
+            TaskStep(type=StepType.LOCAL, action="generate_health_report", params={},
+            )
+        )
+        plan = TaskPlan(
+            steps=steps,
+            constraints=TaskConstraints(no_delete=True, require_user_confirmation=True),
+        )
+        logger.info("Keyword-planned repo analysis (no URL) %s", plan.task_id)
+        return plan
 
     # 1. Scanning step
     if _SCAN_KEYWORDS.search(objective):
@@ -205,7 +295,7 @@ def _plan_with_keywords(objective: str) -> TaskPlan:
             )
         )
 
-    # Fallback – generic summarise
+    # Fallback -- generic summarise
     if not steps:
         steps.append(
             TaskStep(

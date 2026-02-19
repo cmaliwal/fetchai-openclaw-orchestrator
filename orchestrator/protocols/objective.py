@@ -133,9 +133,25 @@ async def handle_execution_result(ctx: Context, sender: str, msg: TaskExecutionR
     Routes the result back to the original requester — either as an
     ``ObjectiveResponse`` (agent-to-agent) or a ``ChatMessage``
     (if the task was initiated via ASI:One chat).
+
+    IMPORTANT: We must ALWAYS send an ``ObjectiveResponse`` back to the
+    connector (the sender) to satisfy the protocol reply contract,
+    even when the task was chat-originated.
     """
     ctx.logger.info(
         "Execution result for task %s: %s", msg.task_id, msg.status
+    )
+
+    # Always acknowledge the connector with an ObjectiveResponse first
+    await ctx.send(
+        sender,
+        ObjectiveResponse(
+            user_id="system",
+            task_id=msg.task_id,
+            status=msg.status,
+            reason=msg.reason or "",
+            message=f"Task {msg.task_id} result acknowledged.",
+        ),
     )
 
     # --- Check if this was a chat-originated task ----------------------------
@@ -174,37 +190,39 @@ async def _relay_to_chat(ctx: Context, chat_meta: dict, msg: TaskExecutionResult
     """Format a TaskExecutionResult and send it back as a ChatMessage."""
     from orchestrator.protocols.chat import send_chat_reply
 
-    lines = [
-        f"## Execution Complete: `{msg.task_id}`",
-        f"**Status**: {msg.status}",
-    ]
-    if msg.reason:
-        lines.append(f"**Reason**: {msg.reason}")
+    lines: list[str] = []
 
+    if msg.status == "rejected":
+        lines.append(f"Task `{msg.task_id}` was rejected.")
+        if msg.reason:
+            lines.append(f"Reason: {msg.reason}")
+        await send_chat_reply(ctx, chat_meta["sender"], "\n".join(lines))
+        return
+
+    # --- Check if outputs contain a report (weekly or health) ----------------
+    report_text = None
     if msg.outputs:
-        lines.append("")
-        lines.append("### Outputs")
-        for key, value in msg.outputs.items():
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    if isinstance(v, str) and len(v) > 300:
-                        lines.append(f"- **{k}**: *(truncated)* {v[:300]}…")
-                    else:
-                        lines.append(f"- **{k}**: {v}")
-            else:
-                lines.append(f"- **{key}**: {value}")
+        report_text = (
+            msg.outputs.get("generate_report", {}).get("report_text")
+            or msg.outputs.get("generate_health_report", {}).get("report_text")
+        )
 
-    if msg.step_results_json and msg.step_results_json != "[]":
-        try:
-            steps = json.loads(msg.step_results_json)
+    if report_text:
+        # The report IS the primary output - send it directly
+        lines.append(report_text)
+    else:
+        # Generic output formatting
+        lines.append(f"Task `{msg.task_id}` completed ({msg.status}).")
+        if msg.outputs:
             lines.append("")
-            lines.append("### Step Details")
-            for step in steps:
-                emoji = "✅" if step.get("status") == "completed" else "❌"
-                lines.append(f"{emoji} **{step.get('action', '?')}**: {step.get('status', '?')}")
-                if step.get("error"):
-                    lines.append(f"  Error: {step['error']}")
-        except json.JSONDecodeError:
-            pass
+            for key, value in msg.outputs.items():
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        if isinstance(v, str) and len(v) > 300:
+                            lines.append(f"- {k}: {v[:300]}...")
+                        else:
+                            lines.append(f"- {k}: {v}")
+                else:
+                    lines.append(f"- {key}: {value}")
 
     await send_chat_reply(ctx, chat_meta["sender"], "\n".join(lines))

@@ -24,10 +24,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_ALLOWED_ACTIONS: set[str] = {
+    # Weekly report workflow
     "scan_directory",
     "generate_report",
     "summarise_text",
     "post_summary",
+    # Repo analyzer workflow
+    "clone_repo",
+    "analyze_repo",
+    "generate_health_report",
 }
 
 _DEMO_DIR = os.getenv("DEMO_PROJECTS_DIR", "./demo_projects")
