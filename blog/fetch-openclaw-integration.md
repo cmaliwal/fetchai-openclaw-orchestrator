@@ -6,13 +6,51 @@
 
 ## The Problem: AI Agents Need Hands, Not Just Brains
 
-Large Language Models can reason about objectives. Platforms like [ASI:One](https://asi1.ai) and [Agentverse](https://agentverse.ai) let users discover and talk to specialised AI agents. But when the task is **"generate my weekly dev report from local git repos and post a summary to Slack"**, those agents hit a wall.
+Large Language Models can reason about objectives. Platforms like [ASI:One](https://asi1.ai) and [Agentverse](https://agentverse.ai) let users discover and talk to specialised AI agents. But when the task is **"analyze this GitHub repo and give me a health report"** or **"generate my weekly dev report from local git repos"**, those agents hit a wall.
 
-They can *plan* the work. They can't *do* the work, because the data lives on your machine, not in the cloud.
+They can *plan* the work. They can't *do* the work, because real analysis requires running tools like `cloc`, `pip-audit`, and `git log` on actual files.
 
-The obvious fix, giving a remote agent shell access to your laptop, is a security nightmare. Cross-user misuse, uncontrolled command execution, leaked credentials. None of that is acceptable.
+The obvious fix, giving a remote agent shell access to your server, is a security nightmare. Cross-user misuse, uncontrolled command execution, leaked credentials. None of that is acceptable.
 
 So we built something better.
+
+---
+
+## The Use Case: GitHub Repo Health Analyzer
+
+Anyone on [ASI:One](https://asi1.ai) can type:
+
+> **"Analyze https://github.com/fastapi/fastapi"**
+
+And get back a real health report:
+
+```
+Repo Health Report: fastapi/fastapi
+Health Score: 8.7/10 (Grade: A)
+
+Languages:
+  Python: 82.3% (48,200 lines)
+  Markdown: 12.1% (7,100 lines)
+
+Git Activity:
+  Total Commits: 3,456
+  Commits (last 30 days): 124
+  Contributors: 485
+
+Testing:
+  Test Files Found: 340
+  Frameworks Detected: pytest
+
+Best Practices:
+  README: pass
+  LICENSE: pass
+  CI/CD Pipeline: pass
+  SECURITY.md: pass
+```
+
+**Why an LLM alone cannot do this:** ChatGPT cannot clone a repository, run `cloc` to count real lines of code, or execute `git log` to check actual commit history. It would have to guess or hallucinate the numbers. Our agent uses OpenClaw to run the actual tools and return real data.
+
+**Why it is safe:** The repo is cloned into a temporary sandbox. No code from the repo is ever executed, imported, or installed. The agent reads files as text, runs static analysis, and deletes the clone after. If someone points to a repo full of malware, the agent just reports its health score and moves on.
 
 ---
 
@@ -24,13 +62,22 @@ Our integration connects three components:
 |---|---|---|
 | **ASI:One** | Cloud (Fetch) | User sends a natural language objective |
 | **Fetch Orchestrator Agent** | Agentverse (mailbox) | Plans the task using ASI:One LLM, enforces policy, dispatches work |
-| **OpenClaw Connector** | Your machine | Verifies the request, executes it safely, returns results |
+| **OpenClaw Connector** | Your server | Verifies the request, executes it safely, returns results |
 
-The key insight: **the agent that plans the work never touches your files**. And the service that executes the work **never accepts raw commands**, only declarative, policy-checked task plans.
+The key insight: **the agent that plans the work never touches the files**. And the service that executes the work **never accepts raw commands**, only declarative, policy-checked task plans.
 
 ```
 User --> ASI:One --> Orchestrator Agent (Agentverse mailbox) --> [signed task plan] --> OpenClaw Connector --> Execution --> Results
 ```
+
+**What each technology adds:**
+
+| Technology | Role | Without it |
+|---|---|---|
+| **Fetch Agent** | Public discovery, standard protocol, agent-to-agent messaging | Your tool is invisible, requires custom API |
+| **ASI:One** | Natural language interface, user reach, LLM for planning | Users need to learn your API or CLI |
+| **OpenClaw** | Actual execution: `git clone`, `cloc`, analysis tools | LLM can only generate text, not run tools |
+| **Agentverse** | Hosting, mailbox relay, manifest publishing | Your local agent is unreachable from the internet |
 
 ---
 
@@ -136,12 +183,6 @@ class PairDeviceRequest(Model):
     public_key_hex: str       # Ed25519 public key (64 hex chars)
     capabilities: list[str]
 
-class PairDeviceResponse(Model):
-    user_id: str
-    device_id: str
-    status: str               # "paired" or "rejected"
-    message: str
-
 pairing_protocol = Protocol(name="device-pairing", version="0.1.0")
 
 @pairing_protocol.on_message(PairDeviceRequest, replies={PairDeviceResponse})
@@ -161,12 +202,6 @@ class TaskDispatchRequest(Model):
     device_id: str
     task_plan_json: str       # JSON-encoded TaskPlan
     signature: str            # hex-encoded Ed25519 signature
-
-class TaskExecutionResult(Model):
-    task_id: str
-    status: str               # completed | failed | rejected
-    step_results_json: str
-    outputs: dict
 ```
 
 ### Step 5: Intelligent Planning with ASI:One LLM
@@ -184,18 +219,48 @@ client = OpenAI(
 response = client.chat.completions.create(
     model="asi1",
     messages=[
-        {"role": "system", "content": SYSTEM_PROMPT},      # defines available actions
-        {"role": "user", "content": "scan my projects and email a summary"},
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Analyze https://github.com/fastapi/fastapi"},
     ],
     temperature=0.1,
 )
 ```
 
-The system prompt tells the LLM which actions are available (`scan_directory`, `generate_report`, `post_summary`, etc.), what parameters they accept, and what constraints to enforce. The LLM returns a JSON task plan.
+The system prompt tells the LLM which actions are available and what parameters they accept. For the repo analyzer, the available actions are:
 
-If the LLM is unavailable, the planner falls back to keyword matching. The system always works; it just plans more intelligently when the LLM is connected.
+- `clone_repo` - shallow-clone a public GitHub repo into a temp sandbox
+- `analyze_repo` - run static analysis (line counts, git stats, dependency audit, test detection)
+- `generate_health_report` - compile everything into a scored report
 
-### Step 6: Authentication and Signature Verification
+The LLM returns a JSON task plan. If the LLM is unavailable, the planner falls back to keyword matching. The system always works; it just plans more intelligently when the LLM is connected.
+
+### Step 6: The Repo Analyzer Workflow
+
+This is where OpenClaw demonstrates its value. The workflow runs three steps sequentially, chaining outputs:
+
+**Step 1: `clone_repo`**
+- Accepts only public GitHub HTTPS URLs (SSH and non-GitHub URLs rejected)
+- Shallow clone (`--depth 1`) into a temporary directory
+- Enforces a 500 MB size limit
+- Fetches full history for accurate git stats
+
+**Step 2: `analyze_repo`**
+- Counts lines of code by language (uses `cloc` if installed, falls back to extension-based counting)
+- Gathers git statistics: total commits, recent activity, contributors
+- Detects test frameworks and counts test files
+- Parses dependency files (`requirements.txt`, `package.json`, etc.)
+- Checks for best practices: README, LICENSE, .gitignore, CI/CD, SECURITY.md
+- Flags potentially sensitive files committed to the repo
+- Computes a 0-10 health score
+
+**Step 3: `generate_health_report`**
+- Compiles all analysis data into a readable Markdown report
+- Assigns a letter grade (A/B/C/D) based on the score
+- Cleans up the temporary clone directory
+
+**Critical safety point:** At no point does any code from the cloned repository get executed, imported, or installed. The repo is treated as data to be scanned, not code to be run. Same approach as GitHub's own dependency scanner.
+
+### Step 7: Authentication and Signature Verification
 
 Every task dispatch is signed by the orchestrator using Ed25519. The connector verifies before executing.
 
@@ -208,69 +273,36 @@ def sign_payload(private_key, payload_dict):
     digest = hashlib.sha256(canonical.encode()).digest()
     signature = private_key.sign(digest)
     return signature.hex()
-
-def verify_signature(public_key_hex, payload, signature_hex):
-    canonical = json.dumps(payload, sort_keys=True, default=str)
-    digest = hashlib.sha256(canonical.encode()).digest()
-    public_key.verify(bytes.fromhex(signature_hex), digest)
 ```
 
-The connector's `RequestAuthenticator` class wraps this:
+The connector's `RequestAuthenticator` deserialises the task plan JSON, recomputes the canonical hash, and verifies the Ed25519 signature against the orchestrator's public key. Tampered payloads are rejected.
 
-1. Deserialise the task plan JSON
-2. Recompute the canonical hash
-3. Verify the Ed25519 signature against the orchestrator's public key
-4. Reject if the signature is missing, invalid, or the payload was tampered with
+### Step 8: Dual Policy Enforcement
 
-### Step 7: Local Policy Enforcement (Path Sandbox)
-
-Even with valid signatures, the connector enforces its own local policies before executing anything:
+Even with valid signatures, policies are checked at two independent layers:
 
 ```python
 class LocalPolicy:
-    allowed_actions = {"scan_directory", "generate_report", "post_summary"}
+    allowed_actions = {
+        "scan_directory", "generate_report", "post_summary",
+        "clone_repo", "analyze_repo", "generate_health_report",
+    }
     allowed_paths = ["./demo_projects", "~/projects", "/tmp"]
 
     def validate_plan(self, plan):
         for step in plan.steps:
             if step.action not in self.allowed_actions:
                 return RejectionReason.ACTION_NOT_ALLOWED
-            if step has a path param and path not in allowed_paths:
-                return RejectionReason.PATH_NOT_ALLOWED
         return None  # all good
 ```
 
-This is the **dual policy** design:
-- The **orchestrator** checks Fetch-side policies (max steps, rate limits, user quotas)
+- The **orchestrator** checks Fetch-side policies (max steps, rate limits, action allowlists)
 - The **connector** checks local policies (path sandboxing, action allowlists)
 - The orchestrator **cannot bypass** local policies. Your machine always has the final say.
 
-### Step 8: Task Execution Engine
-
-The connector's executor runs each step in the task plan sequentially, chaining outputs between steps:
-
-```python
-def execute_plan(plan):
-    results = []
-    previous_output = {}
-    for step in plan.steps:
-        handler = ACTION_REGISTRY.get(step.action)
-        result = handler(step.params, previous_output)
-        previous_output = result.output
-        results.append(result)
-    return ExecutionResult(task_id=plan.task_id, step_results=results)
-```
-
-For the MVP, the action registry includes:
-- `scan_directory` - walks the demo directory, finds git repos, gathers recent commits
-- `generate_report` - compiles a Markdown dev report from scan results
-- `post_summary` - (stub) prepares the summary for Slack/email delivery
-
 ### Step 9: Async Result Correlation
 
-Because the orchestrator dispatches to the connector asynchronously (via agent messaging), results arrive later as a separate `TaskExecutionResult` message. The orchestrator needs to route results back to the correct requester.
-
-It does this with a pending task store:
+Because the orchestrator dispatches tasks asynchronously, results arrive later as a separate message. The orchestrator routes results back to the correct requester:
 
 ```python
 # When dispatching (in the chat handler):
@@ -280,39 +312,90 @@ ctx.storage.set("chat_pending", json.dumps(pending_dict))
 # When results arrive (in the objective handler):
 chat_meta = chat_dict.pop(msg.task_id, None)
 if chat_meta:
-    # This was a chat-originated task, reply as ChatMessage
     await send_chat_reply(ctx, chat_meta["sender"], formatted_result)
 ```
 
 This lets the same orchestrator handle requests from both ASI:One (via `ChatMessage`) and custom agent clients (via `ObjectiveRequest`), routing results back to the correct sender.
 
+### Step 10: Feedback Loop Protection
+
+When integrating with ASI:One, a practical challenge emerges: ASI:One's LLM sometimes rewrites your agent's responses and sends them back as new objectives, creating an infinite feedback loop. For example, the agent sends "Task dispatched, standing by for results" and ASI:One turns that into "Report mode activated! Gen + Post -- mission running!" and sends it right back.
+
+We solved this with multi-layered protection in the chat handler:
+
+```python
+# 1. Pattern-based echo detection (100+ known ASI:One rewrite patterns)
+_ECHO_PATTERNS = [
+    "task dispatched", "mission running", "report mode activated",
+    "standing by!", "pipeline running", ...
+]
+
+# 2. Emoji density check (ASI:One adds lots of emoji to rewrites)
+if len(emoji_re.findall(text)) >= 3:
+    return True  # likely an echo
+
+# 3. Per-sender cooldown (30 seconds between objectives from same sender)
+if (now - last_dispatch_time) < 30:
+    return  # too soon, ignore
+
+# 4. Exact dedup within 120-second window
+obj_hash = md5(text.encode()).hexdigest()[:12]
+if seen_recently(obj_hash):
+    return  # duplicate, ignore
+
+# 5. Pending task cap (max 5 concurrent tasks, prune stale entries)
+if pending_count > 5:
+    prune_all_pending()
+```
+
+The most important design decision: **do not send intermediate status messages**. Instead of saying "Your task has been dispatched, please wait...", the agent stays silent until the final result arrives. This eliminates the primary trigger for ASI:One's echo behavior. The user receives exactly one message: the completed result.
+
 ---
 
 ## The Complete Data Flow
 
-Here is what happens end-to-end when you type a message in ASI:One:
+Here is what happens end-to-end when you analyze a GitHub repo from ASI:One:
 
 ```
-1. User types: "@agent1q... Generate my weekly dev report"
-2. ASI:One sends a ChatMessage to the agent address
-3. Agentverse mailbox holds the message
-4. Local orchestrator polls and receives it
-5. Chat handler extracts the text objective
-6. Planner calls ASI:One LLM to produce a TaskPlan
-7. Fetch-side policy validates the plan (max steps, allowed actions)
-8. Plan is serialised, signed with Ed25519, wrapped in TaskDispatchRequest
-9. Dispatch is sent to the paired connector's agent address
-10. Connector receives the dispatch
-11. Auth module verifies the Ed25519 signature
-12. Local policy checks path sandboxing and action allowlist
-13. Executor runs each step: scan repos, generate report, post summary
-14. Results are sent back as TaskExecutionResult
-15. Orchestrator receives results, correlates with pending task
-16. Results are formatted and sent back as ChatMessage
-17. ASI:One displays the weekly dev report to the user
+ 1. User types: "Analyze https://github.com/fastapi/fastapi" in ASI:One
+ 2. ASI:One sends a ChatMessage to the agent address
+ 3. Agentverse mailbox holds the message
+ 4. Local orchestrator polls and receives it
+ 5. Chat handler runs feedback loop detection (echo patterns, cooldown, dedup)
+ 6. Chat handler extracts the text and the GitHub URL
+ 7. Planner calls ASI:One LLM to produce a TaskPlan:
+      [clone_repo, analyze_repo, generate_health_report]
+ 8. Fetch-side policy validates the plan (actions allowed, rate limit OK)
+ 9. Plan is serialised, signed with Ed25519, dispatched to the connector
+10. Connector verifies Ed25519 signature
+11. Connector checks local policy (actions in allowlist)
+12. Executor runs clone_repo: shallow-clone into temp sandbox
+13. Executor runs analyze_repo: cloc, git stats, deps, tests, security
+14. Executor runs generate_health_report: compile scored Markdown report
+15. Temp directory deleted, results sent back as TaskExecutionResult
+16. Orchestrator correlates with pending task, formats as ChatMessage
+17. ASI:One displays the health report to the user (no intermediate messages)
 ```
 
-See a real conversation in action: [**View Sample Chat on ASI:One**](https://asi1.ai/shared-chat/78ae5995-bdbb-4fee-a9b4-e1b335e5ff96)
+See a real conversation in action: [**View Sample Chat on ASI:One**](https://asi1.ai/chat/f7ccb160-88bc-46a0-bd44-041483eca338)
+
+---
+
+## Why This Combination Matters
+
+| Question | Answer |
+|---|---|
+| **Can an LLM do this alone?** | No. ChatGPT cannot clone a repo, run `cloc`, or execute `git log`. It would hallucinate the numbers. |
+| **Can OpenClaw do this alone?** | Yes, but only from your terminal. Nobody else can use it. |
+| **Can a Fetch agent do this alone?** | No. It has no execution engine to run analysis tools. |
+| **Why all three together?** | Real analysis (OpenClaw) made discoverable to anyone (Fetch/Agentverse) through natural language (ASI:One). |
+
+The pattern extends beyond repo analysis. The same architecture supports any workflow where you need real tool execution combined with public accessibility:
+- Dependency audits
+- Infrastructure health checks
+- Data pipeline monitoring
+- Document processing
+- CI/CD status dashboards
 
 ---
 
@@ -320,27 +403,33 @@ See a real conversation in action: [**View Sample Chat on ASI:One**](https://asi
 
 | Layer | What it checks | Where |
 |---|---|---|
+| **URL Validation** | Only public GitHub HTTPS URLs accepted | Connector |
+| **Sandbox Execution** | Temp directory, no code execution, auto-cleanup | Connector |
+| **Size Limits** | Repos over 500 MB rejected | Connector |
 | **Device Pairing** | Ed25519 keypair registration | Orchestrator |
 | **Request Signing** | Ed25519 signature on every task dispatch | Connector |
 | **Fetch-side Policy** | Rate limits, max steps, action allowlists | Orchestrator |
 | **Local Policy** | Path sandbox, action allowlist, no background execution | Connector |
 | **Declarative Plans** | No shell commands, only named actions with parameters | Both |
+| **Feedback Loop Protection** | Echo detection, sender cooldown, dedup, pending cap | Orchestrator |
 
-The agent that plans never touches your files. The service that executes never accepts raw commands. Neither can bypass the other's policies.
+The agent that plans never touches the files. The service that executes never accepts raw commands. Neither can bypass the other's policies.
 
 ---
 
-## The MVP: Weekly Dev Report
+## Two Workflows, Same Architecture
 
-For the first release, we ship one complete workflow:
+### 1. GitHub Repo Health Analyzer (public, anyone can use)
+- `clone_repo` - shallow-clone from GitHub into a temp sandbox
+- `analyze_repo` - static analysis: languages, git stats, deps, tests, security
+- `generate_health_report` - scored Markdown report with grade (A/B/C/D)
 
-1. **scan_directory** - walks project directories, finds git repos, gathers commit messages from the last 7 days
-2. **generate_report** - compiles a Markdown dev report from the scan results
-3. **post_summary** - (stub) prepares the summary for Slack or email delivery
+### 2. Weekly Dev Report (paired users only)
+- `scan_directory` - walks project directories, finds git repos, gathers commit messages
+- `generate_report` - compiles a Markdown dev report from the scan results
+- `post_summary` - (stub) prepares the summary for Slack or email delivery
 
-It is simple, but it proves the full pipeline: objective to LLM plan to sign to dispatch to execute to return.
-
-For safe testing, the included `scripts/setup_demo.py` generates a `demo_projects/` directory with fake git repos and sample commit history. No real system data is ever exposed.
+Both use the same pipeline: objective to plan to sign to dispatch to execute to return.
 
 ---
 
@@ -370,8 +459,9 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 # Configure (create .env with your API keys, see README.md for details)
+cp .env.example .env
 
-# Set up demo data (safe fake repos)
+# Set up demo data (safe fake repos for weekly report workflow)
 python scripts/setup_demo.py
 
 # Terminal 1: Orchestrator (with Agentverse mailbox)
@@ -381,26 +471,46 @@ python -m orchestrator.agent
 ORCHESTRATOR_AGENT_ADDRESS=<address-from-terminal-1> python -m connector.server
 ```
 
-All 42 tests pass. The orchestrator and connector auto-pair on startup. See the [README](../README.md) for full setup instructions including mailbox registration and environment variable reference.
+All 68 tests pass. The orchestrator and connector auto-pair on startup. See the [README](../README.md) for full setup instructions including mailbox registration and environment variable reference.
+
+### Test from ASI:One
+
+Once both agents are running and the mailbox is registered, go to [ASI:One](https://asi1.ai) and try:
+
+```
+Analyze https://github.com/fastapi/fastapi
+```
+
+```
+Check the health of https://github.com/pallets/flask
+```
+
+```
+Review https://github.com/cmaliwal/fetchai-openclaw-orchestrator
+```
+
+**See a real conversation:** [View Sample Chat on ASI:One](https://asi1.ai/chat/f7ccb160-88bc-46a0-bd44-041483eca338)
 
 ---
 
 ## What's Next
 
+- **More analysis tools** - integrate `pip-audit`, `npm audit`, `bandit` for security scanning
+- **Comparative analysis** - "compare repo A vs repo B"
+- **Scheduled monitoring** - "check this repo every week and alert me if the score drops"
+- **Multi-agent composition** - one agent clones, another analyzes, another reports
 - **Real Slack/email integration** to replace the `post_summary` stub
-- **Multi-device support** to pair multiple machines to one agent account
-- **Agentverse hosted deployment** for a fully cloud-hosted orchestrator
-- **Paid workflow gating** using Fetch token economics
-- **Output verification agent** that validates execution results before returning them
-- **Additional workflows** like code review, CI status, and dependency audit
+- **PyPI package** - `pip install fetch-openclaw` for easy integration
 
 ---
 
 ## The Bigger Picture
 
-This is not just a dev report generator. It is a **reference architecture** for safe remote-to-local AI orchestration.
+This is not just a repo analyzer. It is a **reference architecture** for safe remote-to-local AI orchestration.
 
-Any Fetch agent can coordinate local work (code analysis, file processing, system administration, data pipelines) through the same pattern: plan remotely, verify cryptographically, execute locally.
+The pattern: a Fetch agent handles discovery and planning, OpenClaw handles execution, and the user never has to choose between AI capability and data safety.
+
+Any Fetch agent can coordinate local work (code analysis, file processing, system administration, data pipelines) through the same design: plan remotely, verify cryptographically, execute locally.
 
 The user stays in control. The agent stays useful. And neither has to trust the other blindly.
 

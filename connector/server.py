@@ -86,6 +86,7 @@ connector_agent = Agent(
 # ---------------------------------------------------------------------------
 
 from orchestrator.protocols.models import (  # noqa: E402
+    ObjectiveResponse,
     PairDeviceRequest,
     PairDeviceResponse,
     TaskDispatchRequest,
@@ -120,7 +121,7 @@ async def on_startup(ctx: Context):
                 user_id=_USER_ID,
                 device_id=_DEVICE_ID,
                 public_key_hex=DEVICE_PUBLIC_KEY_HEX,
-                capabilities=["weekly_report"],
+                capabilities=["weekly_report", "repo_analyzer"],
             ),
         )
     else:
@@ -145,6 +146,14 @@ async def handle_pairing_response(ctx: Context, sender: str, msg: PairDeviceResp
 # ---------------------------------------------------------------------------
 # Handle task dispatch
 # ---------------------------------------------------------------------------
+
+@connector_agent.on_message(ObjectiveResponse)
+async def handle_objective_response(ctx: Context, sender: str, msg: ObjectiveResponse):
+    """Acknowledge receipt of ObjectiveResponse from orchestrator (protocol ack)."""
+    ctx.logger.info(
+        "Orchestrator acknowledged task %s (status: %s)", msg.task_id, msg.status
+    )
+
 
 @connector_agent.on_message(TaskDispatchRequest, replies={TaskExecutionResult})
 async def handle_task_dispatch(ctx: Context, sender: str, msg: TaskDispatchRequest):
